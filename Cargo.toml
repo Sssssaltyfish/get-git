@@ -1,0 +1,15 @@
+[package]
+name = "get-git"
+version = "0.1.0"
+authors = ["Igna <saltyfish2233@gmail.com>"]
+description = "Get subdirectory of github repo by using `svn`"
+categories = ["cli", "svn", "git"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.75"
+clap = { version = "4.4.11", features = ["derive"] }
+http = "1.0.0"
+itertools = "0.12.0"
