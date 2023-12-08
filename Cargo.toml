@@ -5,6 +5,7 @@ authors = ["Igna <saltyfish2233@gmail.com>"]
 description = "Get subdirectory of github repo by using `svn`"
 categories = ["cli", "svn", "git"]
 repository = "https://github.com/Sssssaltyfish/get-git"
+license = "MIT"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
