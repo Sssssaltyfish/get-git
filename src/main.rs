@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::{io::ErrorKind, process::Command};
 
 use anyhow::anyhow;
 use clap::Parser;
@@ -51,12 +51,26 @@ fn main() -> anyhow::Result<()> {
 
     let svn_uri = Uri::from_parts(parts)?;
 
-    Command::new("svn")
+    let res = Command::new("svn")
         .args([
             if is_dir { "checkout" } else { "export" },
             &svn_uri.to_string(),
         ])
-        .status()?;
+        .status();
+
+    match res {
+        Ok(stat) => {
+            if !stat.success() {
+                std::process::exit(stat.code().unwrap_or(-1));
+            }
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            Err(anyhow!("`svn` not found in PATH, consider installing it?"))?;
+        }
+        e @ Err(_) => {
+            e?;
+        }
+    }
 
     Ok(())
 }
