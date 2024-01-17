@@ -1,9 +1,10 @@
-use std::{io::ErrorKind, process::Command};
+use std::{env, fs, io::ErrorKind, process::Command};
 
 use anyhow::anyhow;
 use clap::Parser;
-use http::{uri::PathAndQuery, Uri};
+use http::Uri;
 use itertools::Itertools;
+use tempdir::TempDir;
 
 #[derive(Parser)]
 struct Cli {
@@ -12,65 +13,76 @@ struct Cli {
 
 fn main() -> anyhow::Result<()> {
     let Cli { uri } = Cli::parse();
-    let mut parts = uri.into_parts();
+    let parts = uri.into_parts();
     let path_and_query = parts.path_and_query.ok_or(anyhow!("No path specified"))?;
 
-    let mut segs = path_and_query
+    let segs = path_and_query
         .path()
-        .trim_end_matches('/')
+        .trim_matches('/')
         .split('/')
         .collect_vec();
 
-    let mut is_dir = true;
-    let idx = segs
-        .iter()
-        .rposition(|&s| match s {
-            "tree" => true,
-            "blob" => {
-                is_dir = false;
-                true
-            }
-            _ => false,
-        })
-        .ok_or(anyhow!("Not a github repo"))?;
+    let (user, repo, _is_file, branch, path) = || -> Option<_> {
+        let mut it = segs.iter().copied();
+        let ret = (
+            it.next()?,
+            it.next()?,
+            it.next()? == "blob",
+            it.next()?,
+            it.join("/"),
+        );
+        Some(ret)
+    }()
+    .ok_or(anyhow!("Invalid github url"))?;
 
-    let branch = segs[idx + 1];
-    match branch {
-        "master" | "main" => {
-            segs[idx] = "trunk";
-            segs.remove(idx + 1);
-        }
-        _ => {
-            segs[idx] = "branches";
-        }
+    let repo_url = format!(
+        "https://{}/{}/{}",
+        parts.authority.unwrap().host(),
+        user,
+        repo,
+    );
+
+    let tmp = TempDir::new("get-git")?;
+    let repo_path = tmp.path().join(repo);
+
+    let pwd = env::current_dir()?;
+    let target = pwd.join(path.rsplit('/').next().unwrap());
+
+    if target.exists() {
+        return Err(anyhow!("Target path not empty: {}", target.display()));
     }
 
-    let final_path = segs.iter().join("/") + path_and_query.query().unwrap_or_default();
-    let new_path_and_query = PathAndQuery::from_maybe_shared(final_path)?;
-    parts.path_and_query = Some(new_path_and_query);
-
-    let svn_uri = Uri::from_parts(parts)?;
-
-    let res = Command::new("svn")
-        .args([
-            if is_dir { "checkout" } else { "export" },
-            &svn_uri.to_string(),
-        ])
+    let ret = Command::new("git")
+        .args(["clone", "-n", "--depth=1", "--filter=tree:0", &repo_url])
+        .current_dir(tmp.path())
         .status();
 
-    match res {
-        Ok(stat) => {
-            if !stat.success() {
-                std::process::exit(stat.code().unwrap_or(-1));
+    match ret {
+        Err(e) => {
+            if e.kind() == ErrorKind::NotFound {
+                return Err(anyhow!("`git` not found in path, consider installing it?"));
+            } else {
+                return Err(anyhow!("Failed to clone: {}", e));
             }
         }
-        Err(err) if err.kind() == ErrorKind::NotFound => {
-            Err(anyhow!("`svn` not found in PATH, consider installing it?"))?;
-        }
-        e @ Err(_) => {
-            e?;
-        }
+        _ => {}
     }
+
+    Command::new("git")
+        .args(["sparse-checkout", "set", "--no-cone", "--", &path])
+        .current_dir(&repo_path)
+        .status()
+        .map_err(|e| anyhow!("Failed to set sparse-checkout: {}", e))?;
+
+    Command::new("git")
+        .args(["checkout", branch, "--", &path])
+        .current_dir(&repo_path)
+        .status()
+        .map_err(|e| anyhow!("Failed to checkout: {}", e))?;
+
+    fs::rename(repo_path.join(&path), target)?;
+
+    tmp.close()?;
 
     Ok(())
 }
