@@ -11,6 +11,22 @@ struct Cli {
     pub uri: Uri,
 }
 
+macro_rules! exec {
+    ( $name:tt; $dir:expr, $args:tt ) => {
+        Command::new("git")
+            .args($args)
+            .current_dir($dir)
+            .status()
+            .map_err(|e| anyhow!(concat!("Failed to ", $name, ": {}"), e))
+            .and_then(|status| {
+                status.success().then_some(()).ok_or(anyhow!(
+                    concat!("Failed to ", $name, ": program exited with code {}"),
+                    status
+                ))
+            })?;
+    };
+}
+
 fn main() -> anyhow::Result<()> {
     let Cli { uri } = Cli::parse();
     let parts = uri.into_parts();
@@ -68,17 +84,18 @@ fn main() -> anyhow::Result<()> {
         _ => {}
     }
 
-    Command::new("git")
-        .args(["sparse-checkout", "set", "--no-cone", "--", &path])
-        .current_dir(&repo_path)
-        .status()
-        .map_err(|e| anyhow!("Failed to set sparse-checkout: {}", e))?;
+    exec!("set sparse checkout"; &repo_path, [
+        "sparse-checkout",
+        "set",
+        "--sparse-index",
+        "--no-cone",
+        "--",
+        &path,
+    ]);
 
-    Command::new("git")
-        .args(["checkout", branch, "--", &path])
-        .current_dir(&repo_path)
-        .status()
-        .map_err(|e| anyhow!("Failed to checkout: {}", e))?;
+    exec!("checkout"; &repo_path, [
+        "checkout", branch
+    ]);
 
     fs::rename(repo_path.join(&path), target)?;
 
