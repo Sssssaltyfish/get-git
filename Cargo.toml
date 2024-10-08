@@ -1,6 +1,6 @@
 [package]
 name = "get-git"
-version = "0.1.2"
+version = "0.1.3"
 authors = ["Igna <saltyfish2233@gmail.com>"]
 description = "Get subdirectory of github repo by using `git clone --filter` and `git sparse-checkout`"
 categories = ["command-line-utilities", "accessibility"]
