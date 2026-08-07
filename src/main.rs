@@ -1,105 +1,97 @@
-use std::{env, fs, io::ErrorKind, process::Command};
+use std::path::PathBuf;
 
-use anyhow::anyhow;
+use anyhow::Result;
 use clap::Parser;
-use http::Uri;
-use itertools::Itertools;
-use tempdir::TempDir;
+use get_git::{download, Backend, ConfigSource, DownloadOptions};
 
-#[derive(Parser)]
+#[derive(Debug, Parser)]
+#[command(
+    version,
+    about = "Download one file or directory from a GitHub repository",
+    long_about = "Download one file or directory from a GitHub repository. The default auto backend prefers Git 2.49+ for partial-clone performance and falls back to embedded libgit2."
+)]
 struct Cli {
-    pub uri: Uri,
+    /// A GitHub blob/tree/raw URL, or a repository URL when --path is supplied
+    source: String,
+
+    /// Exact output file or directory path (defaults to the source basename)
+    #[arg(short, long, value_name = "PATH")]
+    output: Option<PathBuf>,
+
+    /// Explicit branch, tag, commit, or other fetchable Git reference
+    #[arg(short = 'r', long = "ref", value_name = "REF")]
+    reference: Option<String>,
+
+    /// Explicit repository-relative file or directory path
+    #[arg(short, long, value_name = "REPO_PATH")]
+    path: Option<String>,
+
+    /// Git implementation used for network and object transfer
+    #[arg(long, value_enum, default_value_t = Backend::Auto)]
+    backend: Backend,
+
+    /// Base directory for an auto-removed temporary working directory
+    #[arg(long, visible_alias = "temp-dir", value_name = "DIR")]
+    work_dir: Option<PathBuf>,
+
+    /// Use exactly this Git configuration file
+    #[arg(long, value_name = "PATH", group = "config-source")]
+    git_config: Option<PathBuf>,
+
+    /// Use the current project's local Git configuration
+    #[arg(long, group = "config-source")]
+    project_config: bool,
+
+    /// Use the standard per-user Git configuration files
+    #[arg(long, group = "config-source")]
+    user_config: bool,
+
+    /// Use the standard system-wide Git configuration file
+    #[arg(long, group = "config-source")]
+    system_config: bool,
+
+    /// Replace an existing output path after the download succeeds
+    #[arg(short, long)]
+    force: bool,
+
+    /// Suppress the success message
+    #[arg(short, long)]
+    quiet: bool,
 }
 
-macro_rules! exec {
-    ( $name:tt; $dir:expr, $args:tt ) => {
-        Command::new("git")
-            .args($args)
-            .current_dir($dir)
-            .status()
-            .map_err(|e| anyhow!(concat!("Failed to ", $name, ": {}"), e))
-            .and_then(|status| {
-                status.success().then_some(()).ok_or(anyhow!(
-                    concat!("Failed to ", $name, ": program exited with code {}"),
-                    status
-                ))
-            })?;
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let config = match cli.git_config {
+        Some(path) => ConfigSource::File(path),
+        None if cli.project_config => ConfigSource::Project,
+        None if cli.user_config => ConfigSource::User,
+        None if cli.system_config => ConfigSource::System,
+        None => ConfigSource::Bundled,
     };
-}
+    let options = DownloadOptions {
+        backend: cli.backend,
+        config,
+        work_dir: cli.work_dir,
+        force: cli.force,
+    };
+    let result = download(
+        &cli.source,
+        cli.reference.as_deref(),
+        cli.path.as_deref(),
+        cli.output,
+        &options,
+    )?;
 
-fn main() -> anyhow::Result<()> {
-    let Cli { uri } = Cli::parse();
-    let parts = uri.into_parts();
-    let path_and_query = parts.path_and_query.ok_or(anyhow!("No path specified"))?;
-
-    let segs = path_and_query
-        .path()
-        .trim_matches('/')
-        .split('/')
-        .collect_vec();
-
-    let (user, repo, _is_file, branch, path) = || -> Option<_> {
-        let mut it = segs.iter().copied();
-        let ret = (
-            it.next()?,
-            it.next()?,
-            it.next()? == "blob",
-            it.next()?,
-            it.join("/"),
+    if !cli.quiet {
+        println!(
+            "Downloaded {}@{}:{} -> {} ({} backend)",
+            result.repository,
+            result.reference,
+            result.path,
+            result.output.display(),
+            result.backend
         );
-        Some(ret)
-    }()
-    .ok_or(anyhow!("Invalid github url"))?;
-
-    let repo_url = format!(
-        "https://{}/{}/{}",
-        parts.authority.unwrap().host(),
-        user,
-        repo,
-    );
-
-    let tmp = TempDir::new("get-git")?;
-    let repo_path = tmp.path().join(repo);
-
-    let pwd = env::current_dir()?;
-    let target = pwd.join(path.rsplit('/').next().unwrap());
-
-    if target.exists() {
-        return Err(anyhow!("Target path not empty: {}", target.display()));
     }
-
-    let ret = Command::new("git")
-        .args(["clone", "-n", "--depth=1", "--filter=tree:0", &repo_url])
-        .current_dir(tmp.path())
-        .status();
-
-    match ret {
-        Err(e) => {
-            if e.kind() == ErrorKind::NotFound {
-                return Err(anyhow!("`git` not found in path, consider installing it?"));
-            } else {
-                return Err(anyhow!("Failed to clone: {}", e));
-            }
-        }
-        _ => {}
-    }
-
-    exec!("set sparse checkout"; &repo_path, [
-        "sparse-checkout",
-        "set",
-        "--sparse-index",
-        "--no-cone",
-        "--",
-        &path,
-    ]);
-
-    exec!("checkout"; &repo_path, [
-        "checkout", branch
-    ]);
-
-    fs::rename(repo_path.join(&path), target)?;
-
-    tmp.close()?;
 
     Ok(())
 }

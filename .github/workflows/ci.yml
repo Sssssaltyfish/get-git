@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run default unit and end-to-end tests
+        run: cargo test --all-targets
+
+      - name: Lint default build
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Check embedded-only build
+        run: cargo clippy --all-targets --no-default-features --features backend-git2,vendored-openssl -- -D warnings
+
+      - name: Check system-only build
+        run: cargo clippy --all-targets --no-default-features --features backend-system -- -D warnings
