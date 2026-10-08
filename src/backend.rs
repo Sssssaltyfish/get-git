@@ -22,7 +22,7 @@ pub enum Backend {
     /// Prefer optimized system Git and fall back to the embedded backend.
     #[default]
     Auto,
-    /// Use embedded libgit2 without invoking a git executable.
+    /// Use embedded libgit2 for network and object transfer.
     #[cfg(feature = "backend-git2")]
     Git2,
     /// Use Git from PATH after checking its version.

@@ -251,6 +251,7 @@ fn help_exposes_backend_work_directory_and_config_controls() {
         "--work-dir",
         "--temp-dir",
         "--git-config",
+        "--bundled-config",
         "--project-config",
         "--user-config",
         "--system-config",

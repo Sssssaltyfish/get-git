@@ -6,6 +6,8 @@ use std::{
 use anyhow::{bail, Context, Result};
 use tempfile::Builder;
 
+#[cfg(all(test, unix))]
+mod auth_tests;
 mod backend;
 mod config;
 #[cfg(feature = "backend-git2")]

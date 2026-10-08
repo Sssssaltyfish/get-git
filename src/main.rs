@@ -34,6 +34,10 @@ struct Cli {
     #[arg(long, visible_alias = "temp-dir", value_name = "DIR")]
     work_dir: Option<PathBuf>,
 
+    /// Use only bundled defaults, without system/user credential helpers
+    #[arg(long, group = "config-source")]
+    bundled_config: bool,
+
     /// Use exactly this Git configuration file
     #[arg(long, value_name = "PATH", group = "config-source")]
     git_config: Option<PathBuf>,
@@ -66,7 +70,8 @@ fn main() -> Result<()> {
         None if cli.project_config => ConfigSource::Project,
         None if cli.user_config => ConfigSource::User,
         None if cli.system_config => ConfigSource::System,
-        None => ConfigSource::Bundled,
+        None if cli.bundled_config => ConfigSource::Bundled,
+        None => ConfigSource::Default,
     };
     let options = DownloadOptions {
         backend: cli.backend,

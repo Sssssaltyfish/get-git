@@ -9,8 +9,10 @@ const BUNDLED_CONFIG: &str = include_str!("bundled.gitconfig");
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum ConfigSource {
-    /// Use the small configuration compiled into the executable.
+    /// Use bundled transport defaults and system/user credential settings.
     #[default]
+    Default,
+    /// Use only the small configuration compiled into the executable.
     Bundled,
     /// Use the local configuration of the project containing the current directory.
     Project,
@@ -40,6 +42,7 @@ pub(crate) fn prepare(
 ) -> Result<PreparedConfig> {
     let path = work_dir.join("gitconfig");
     let contents = match source {
+        ConfigSource::Default => default_config(work_dir)?,
         ConfigSource::Bundled => BUNDLED_CONFIG.to_owned(),
         ConfigSource::File(selected) => {
             let selected = existing_file(absolute(selected, current_dir)?, "Git configuration")?;
@@ -60,6 +63,170 @@ pub(crate) fn prepare(
         .with_context(|| format!("Invalid Git configuration selected via {}", path.display()))?;
 
     Ok(PreparedConfig { path })
+}
+
+// Authentication is independent of transport configuration: a private download
+// should use the installed credential manager without also enabling ambient URL
+// rewrites, checkout filters, proxies, or TLS overrides. Preserve entry order and
+// empty helper values, which Git uses to reset a lower-priority helper chain.
+fn default_config(work_dir: &Path) -> Result<String> {
+    let mut contents = BUNDLED_CONFIG.to_owned();
+    for (name, value) in credential_settings(work_dir)? {
+        append_credential_setting(&mut contents, &name, &value);
+    }
+    Ok(contents)
+}
+
+fn append_credential_setting(contents: &mut String, name: &str, value: &str) {
+    let Some(name) = name.strip_prefix("credential.") else {
+        return;
+    };
+    if let Some((url, variable)) = name.rsplit_once('.') {
+        contents.push_str(&format!(
+            "\n[credential \"{}\"]\n\t{variable} = \"{}\"\n",
+            escape_config_value(url),
+            escape_config_value(value)
+        ));
+    } else {
+        contents.push_str(&format!(
+            "\n[credential]\n\t{name} = \"{}\"\n",
+            escape_config_value(value)
+        ));
+    }
+}
+
+fn escape_config_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t")
+        .replace('\u{8}', "\\b")
+}
+
+fn credential_settings(_work_dir: &Path) -> Result<Vec<(String, String)>> {
+    #[cfg(feature = "backend-system")]
+    {
+        use std::process::{Command, Stdio};
+
+        // Query only credentials and prevent repository discovery, even when
+        // --work-dir is inside another checkout. Git resolves its own system
+        // installation path, includes, and GIT_CONFIG_* overrides correctly.
+        let output = Command::new("git")
+            .args([
+                "config",
+                "--includes",
+                "--null",
+                "--get-regexp",
+                "^credential\\.",
+            ])
+            .current_dir(_work_dir)
+            .env(
+                "GIT_CEILING_DIRECTORIES",
+                _work_dir.parent().unwrap_or(_work_dir),
+            )
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_CONFIG")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .stdin(Stdio::null())
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                let text = String::from_utf8(output.stdout)
+                    .context("Git credential configuration is not valid UTF-8")?;
+                return text
+                    .split('\0')
+                    .filter(|entry| !entry.is_empty())
+                    .map(|entry| {
+                        let (key, value) = entry.split_once('\n').unwrap_or((entry, "true"));
+                        Ok((key.to_owned(), value.to_owned()))
+                    })
+                    .collect();
+            }
+            Ok(output) if output.status.code() == Some(1) => return Ok(Vec::new()),
+            // Do not include configuration output: helper definitions may
+            // contain secrets. Explicit isolated configuration is still usable.
+            Ok(_) => bail!(
+                "Failed to read Git credential configuration; check your Git configuration or use --bundled-config"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("Failed to read Git credential configuration"),
+        }
+    }
+
+    #[cfg(feature = "backend-git2")]
+    {
+        let config = credential_config_git2()?;
+        let mut settings = Vec::new();
+        let mut entries = config.entries(Some("^credential\\."))?;
+        while let Some(entry) = entries.next() {
+            let entry = entry?;
+            let name = entry
+                .name()
+                .context("Git credential key is not valid UTF-8")?;
+            let value = if entry.has_value() {
+                entry
+                    .value()
+                    .context("Git credential value is not valid UTF-8")?
+            } else {
+                "true"
+            };
+            settings.push((name.to_owned(), value.to_owned()));
+        }
+        Ok(settings)
+    }
+    #[cfg(not(feature = "backend-git2"))]
+    bail!("Git was not found in PATH")
+}
+
+#[cfg(feature = "backend-git2")]
+fn credential_config_git2() -> Result<git2::Config> {
+    use git2::{Config, ConfigLevel};
+
+    // libgit2's default discovery does not honor Git's environment overrides.
+    // Resolve those explicitly so embedded-only/no-Git runs use the same files.
+    let mut sources = Vec::new();
+    let no_system = env::var("GIT_CONFIG_NOSYSTEM").unwrap_or_default();
+    let no_system = match no_system.to_ascii_lowercase().as_str() {
+        "" | "false" | "no" | "off" => false,
+        "true" | "yes" | "on" => true,
+        value => {
+            value
+                .parse::<i64>()
+                .context("Invalid GIT_CONFIG_NOSYSTEM")?
+                != 0
+        }
+    };
+    if !no_system {
+        if let Some(path) = env::var_os("GIT_CONFIG_SYSTEM")
+            .map(PathBuf::from)
+            .or_else(|| Config::find_system().ok())
+        {
+            sources.push((ConfigLevel::System, path));
+        }
+    }
+    if let Some(path) = env::var_os("GIT_CONFIG_GLOBAL") {
+        sources.push((ConfigLevel::Global, PathBuf::from(path)));
+    } else {
+        if let Ok(path) = Config::find_xdg() {
+            sources.push((ConfigLevel::XDG, path));
+        }
+        if let Ok(path) = Config::find_global() {
+            sources.push((ConfigLevel::Global, path));
+        }
+    }
+    let mut config = Config::new()?;
+    for (level, path) in sources {
+        if path.is_file() {
+            config
+                .add_file(&path, level, true)
+                .context("Failed to read system/user Git credential configuration")?;
+        }
+    }
+    Ok(config)
 }
 
 fn include_config(paths: &[PathBuf]) -> Result<String> {
@@ -248,6 +415,79 @@ fn system_config_files() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_copy_preserves_order_scopes_resets_and_quoting() {
+        let mut contents = BUNDLED_CONFIG.to_owned();
+        for (name, value) in [
+            ("credential.helper", "first"),
+            ("credential.helper", ""),
+            ("credential.helper", "/path/with\\ spaces/manager"),
+            (
+                "credential.https://example.invalid:8443/team.usehttppath",
+                "true",
+            ),
+            ("credential.username", "a\"b\\c\nd\te"),
+            ("http.proxy", "must-not-inherit"),
+            ("core.hooksPath", "must-not-inherit"),
+        ] {
+            append_credential_setting(&mut contents, name, value);
+        }
+        assert!(!contents.contains("must-not-inherit"));
+        assert!(contents.contains("[credential \"https://example.invalid:8443/team\"]"));
+        assert!(contents.contains("helper = \"\""));
+        #[cfg(feature = "backend-git2")]
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("gitconfig");
+            fs::write(&path, contents).unwrap();
+            let config = git2::Config::open(&path).unwrap();
+            let mut helpers = Vec::new();
+            config
+                .multivar("credential.helper", None)
+                .unwrap()
+                .for_each(|entry| {
+                    helpers.push(entry.value().unwrap().to_owned());
+                })
+                .unwrap();
+            assert_eq!(helpers, ["first", "", "/path/with\\ spaces/manager"]);
+            assert_eq!(
+                config.get_string("credential.username").unwrap(),
+                "a\"b\\c\nd\te"
+            );
+            assert!(config
+                .get_bool("credential.https://example.invalid:8443/team.usehttppath")
+                .unwrap());
+        }
+    }
+
+    #[cfg(feature = "backend-system")]
+    #[test]
+    fn credential_discovery_does_not_read_the_work_directorys_parent_repository() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let git = temp.path().join(".git");
+        fs::create_dir_all(git.join("objects")).unwrap();
+        fs::create_dir(git.join("refs")).unwrap();
+        fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(
+            git.join("config"),
+            "[credential]\n helper = get-git-test-must-not-inherit\n",
+        )
+        .unwrap();
+        let work = temp.path().join("work");
+        fs::create_dir(&work).unwrap();
+        let settings = credential_settings(&work).unwrap();
+        assert!(!settings
+            .iter()
+            .any(|(_, value)| value == "get-git-test-must-not-inherit"));
+    }
 
     #[test]
     fn bundled_config_is_valid_and_portable() {
