@@ -9,6 +9,8 @@ use tempfile::Builder;
 mod backend;
 mod config;
 #[cfg(feature = "backend-git2")]
+mod credentials;
+#[cfg(feature = "backend-git2")]
 mod materialize;
 mod source;
 

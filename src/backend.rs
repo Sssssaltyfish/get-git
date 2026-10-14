@@ -22,7 +22,7 @@ pub enum Backend {
     /// Prefer optimized system Git and fall back to the embedded backend.
     #[default]
     Auto,
-    /// Use embedded libgit2 without invoking a git executable.
+    /// Use embedded libgit2 for transfers (Git may be used for credential helpers).
     #[cfg(feature = "backend-git2")]
     Git2,
     /// Use Git from PATH after checking its version.
@@ -168,7 +168,7 @@ fn advertise_git2(
     let mut remote = repository
         .remote_anonymous(repository_url)
         .with_context(|| format!("Failed to configure remote {repository_url}"))?;
-    let callbacks = git2_callbacks(&selected_config);
+    let callbacks = git2_callbacks(&selected_config, config.path());
     let mut proxy = ProxyOptions::new();
     proxy.auto();
     let connection = remote
@@ -222,12 +222,12 @@ fn fetch_and_materialize_git2(
         request.revision.clone()
     };
     let shallow_result = {
-        let mut fetch_options = git2_fetch_options(&selected_config, true);
+        let mut fetch_options = git2_fetch_options(&selected_config, config.path(), true);
         remote.fetch(&[&refspec], Some(&mut fetch_options), None)
     };
     if let Err(error) = shallow_result {
         if error.message().contains("shallow fetch is not supported") {
-            let mut fetch_options = git2_fetch_options(&selected_config, false);
+            let mut fetch_options = git2_fetch_options(&selected_config, config.path(), false);
             remote
                 .fetch(&[&refspec], Some(&mut fetch_options), None)
                 .context(
@@ -278,6 +278,7 @@ fn fetch_and_materialize_git2(
 #[cfg(feature = "backend-git2")]
 fn git2_fetch_options<'config>(
     config: &'config git2::Config,
+    config_path: &'config Path,
     shallow: bool,
 ) -> git2::FetchOptions<'config> {
     use git2::{AutotagOption, FetchOptions, ProxyOptions};
@@ -286,7 +287,7 @@ fn git2_fetch_options<'config>(
     proxy.auto();
     let mut options = FetchOptions::new();
     options
-        .remote_callbacks(git2_callbacks(config))
+        .remote_callbacks(git2_callbacks(config, config_path))
         .proxy_options(proxy)
         .download_tags(AutotagOption::None);
     if shallow {
@@ -313,7 +314,10 @@ fn attach_git2_config(
 }
 
 #[cfg(feature = "backend-git2")]
-fn git2_callbacks(config: &git2::Config) -> git2::RemoteCallbacks<'_> {
+fn git2_callbacks<'a>(
+    config: &'a git2::Config,
+    config_path: &'a Path,
+) -> git2::RemoteCallbacks<'a> {
     use git2::{Cred, CredentialType, Error, RemoteCallbacks};
 
     let mut callbacks = RemoteCallbacks::new();
@@ -325,9 +329,7 @@ fn git2_callbacks(config: &git2::Config) -> git2::RemoteCallbacks<'_> {
         }
         if allowed.contains(CredentialType::USER_PASS_PLAINTEXT) && !helper_attempted {
             helper_attempted = true;
-            if let Ok(credential) = Cred::credential_helper(config, url, username) {
-                return Ok(credential);
-            }
+            return crate::credentials::fill(config, config_path, url, username);
         }
         if allowed.contains(CredentialType::SSH_KEY) && !ssh_agent_attempted {
             ssh_agent_attempted = true;
@@ -589,15 +591,7 @@ impl SystemGit {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new("git");
-        command
-            .env("GIT_CONFIG_GLOBAL", &self.config)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env_remove("GIT_CONFIG_SYSTEM")
-            .env_remove("GIT_CONFIG_COUNT")
-            .env_remove("GIT_CONFIG_PARAMETERS")
-            .env_remove("GIT_CONFIG");
-        command
+        crate::config::isolated_git_command(&self.config)
     }
 
     fn run<I, S>(&self, cwd: Option<&Path>, args: I) -> Result<()>

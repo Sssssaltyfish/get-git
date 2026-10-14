@@ -11,6 +11,182 @@ use git2::{Oid, Repository, Signature};
 const SOURCE: &str = "https://github.com/local/fixture.git";
 
 #[test]
+fn private_http_repository_uses_helpers_for_advertisement_and_fetch() {
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        net::TcpListener,
+        process::Stdio,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        },
+        thread,
+        time::Duration,
+    };
+
+    if Command::new("git").arg("--version").output().is_err() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let root = fixture.temp.path().to_owned();
+    let repository = Repository::open_bare(root.join("source repository.git")).unwrap();
+    repository
+        .config()
+        .unwrap()
+        .set_bool("uploadpack.allowFilter", true)
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let stopped = Arc::new(AtomicBool::new(false));
+    let challenges = Arc::new(AtomicUsize::new(0));
+    let authenticated = Arc::new(AtomicUsize::new(0));
+    let stop = stopped.clone();
+    let rejected = challenges.clone();
+    let accepted = authenticated.clone();
+    let server = thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("{error}"),
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut first = String::new();
+            reader.read_line(&mut first).unwrap();
+            let mut authorized = false;
+            let mut length = 0;
+            let mut content_type = String::new();
+            let mut protocol = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+                let (key, value) = line.split_once(':').unwrap();
+                match key.to_ascii_lowercase().as_str() {
+                    "authorization" => authorized = value.trim() == "Basic Zml4dHVyZTpzZWNyZXQ=",
+                    "content-length" => length = value.trim().parse().unwrap(),
+                    "content-type" => content_type = value.trim().to_owned(),
+                    "git-protocol" => protocol = value.trim().to_owned(),
+                    _ => {}
+                }
+            }
+            if !authorized {
+                rejected.fetch_add(1, Ordering::Relaxed);
+                stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=fixture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                continue;
+            }
+            accepted.fetch_add(1, Ordering::Relaxed);
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let mut parts = first.split_whitespace();
+            let method = parts.next().unwrap();
+            let target = parts.next().unwrap();
+            let (path, query) = target.split_once('?').unwrap_or((target, ""));
+            let mut child = Command::new("git")
+                .arg("http-backend")
+                .env("GIT_PROJECT_ROOT", &root)
+                .env("GIT_HTTP_EXPORT_ALL", "1")
+                .env("PATH_INFO", path.replace("%20", " "))
+                .env("QUERY_STRING", query)
+                .env("REQUEST_METHOD", method)
+                .env("CONTENT_TYPE", content_type)
+                .env("CONTENT_LENGTH", length.to_string())
+                .env("HTTP_GIT_PROTOCOL", protocol)
+                .env("REMOTE_USER", "fixture")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(&body).unwrap();
+            let response = child.wait_with_output().unwrap();
+            assert!(
+                response.status.success(),
+                "{}",
+                String::from_utf8_lossy(&response.stderr)
+            );
+            let split = response
+                .stdout
+                .windows(4)
+                .position(|value| value == b"\r\n\r\n")
+                .unwrap();
+            let headers = String::from_utf8_lossy(&response.stdout[..split]);
+            let payload = &response.stdout[split + 4..];
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\n{headers}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            )
+            .unwrap();
+            stream.write_all(payload).unwrap();
+        }
+    });
+
+    fs::write(
+        &fixture.config,
+        format!(
+            r#"
+[url "http://{address}/source%20repository.git"]
+    insteadOf = {SOURCE}
+[credential]
+    helper = "!f() {{ echo username=fixture; echo password=secret; }}; f"
+"#
+        ),
+    )
+    .unwrap();
+    let backends: &[&str] = &["git2"];
+    #[cfg(feature = "backend-system")]
+    let backends = if system_git_is_supported() {
+        &["git2", "system"]
+    } else {
+        backends
+    };
+    let results = backends
+        .iter()
+        .map(|backend| {
+            let output = fixture.temp.path().join(format!("private-{backend}"));
+            let result = command(fixture.temp.path())
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .args([
+                    SOURCE,
+                    "--backend",
+                    backend,
+                    "--git-config",
+                    fixture.config.to_str().unwrap(),
+                    "--ref",
+                    "main",
+                    "--path",
+                    "assets",
+                    "--output",
+                    output.to_str().unwrap(),
+                ])
+                .output()
+                .unwrap();
+            (result, output)
+        })
+        .collect::<Vec<_>>();
+    stopped.store(true, Ordering::Relaxed);
+    server.join().unwrap();
+    for (result, output) in results {
+        assert_success(&result);
+        assert_eq!(read_text(&output.join("config.txt")), "main\n");
+        assert_eq!(read_text(&output.join("nested/data.txt")), "nested\n");
+    }
+    assert!(challenges.load(Ordering::Relaxed) >= backends.len() * 2);
+    assert!(authenticated.load(Ordering::Relaxed) >= backends.len() * 2);
+}
+
+#[test]
 fn embedded_backend_downloads_without_an_environment_git() {
     let fixture = Fixture::new();
     let output_root = fixture.temp.path().join("output");

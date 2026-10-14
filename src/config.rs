@@ -1,6 +1,7 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use anyhow::{bail, Context, Result};
@@ -9,7 +10,7 @@ const BUNDLED_CONFIG: &str = include_str!("bundled.gitconfig");
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum ConfigSource {
-    /// Use the small configuration compiled into the executable.
+    /// Use bundled settings plus the host's credential configuration, when Git is available.
     #[default]
     Bundled,
     /// Use the local configuration of the project containing the current directory.
@@ -40,7 +41,11 @@ pub(crate) fn prepare(
 ) -> Result<PreparedConfig> {
     let path = work_dir.join("gitconfig");
     let contents = match source {
-        ConfigSource::Bundled => BUNDLED_CONFIG.to_owned(),
+        ConfigSource::Bundled => {
+            let mut contents = BUNDLED_CONFIG.to_owned();
+            contents.push_str(&ambient_credentials(current_dir)?);
+            contents
+        }
         ConfigSource::File(selected) => {
             let selected = existing_file(absolute(selected, current_dir)?, "Git configuration")?;
             include_config(&[selected])?
@@ -76,6 +81,83 @@ fn include_config(paths: &[PathBuf]) -> Result<String> {
         contents.push_str("\"\n");
     }
     Ok(contents)
+}
+
+// Let Git discover its installation-specific system config and resolve includes in
+// the caller's context. Only credential settings cross the isolation boundary.
+fn ambient_credentials(current_dir: &Path) -> Result<String> {
+    let mut command = Command::new("git");
+    command.current_dir(current_dir);
+    read_credentials(command)
+}
+
+fn read_credentials(mut command: Command) -> Result<String> {
+    let output = match command
+        .args([
+            "config",
+            "--null",
+            "--includes",
+            "--get-regexp",
+            "^credential\\.",
+        ])
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(error) => return Err(error).context("Failed to discover Git credential configuration"),
+    };
+    if output.status.code() == Some(1) && output.stdout.is_empty() {
+        return Ok(String::new());
+    }
+    if !output.status.success() {
+        bail!(
+            "Git could not read credential configuration ({})",
+            output.status
+        );
+    }
+    credential_config(&output.stdout)
+}
+
+fn credential_config(bytes: &[u8]) -> Result<String> {
+    let text = std::str::from_utf8(bytes).context("Git credential configuration is not UTF-8")?;
+    let mut contents = String::new();
+    for entry in text.split('\0').filter(|entry| !entry.is_empty()) {
+        let (key, value) = entry.split_once('\n').unwrap_or((entry, "true"));
+        let key = key
+            .strip_prefix("credential.")
+            .context("Unexpected credential configuration key")?;
+        if let Some((scope, name)) = key.rsplit_once('.') {
+            contents.push_str(&format!("\n[credential \"{}\"]\n", escape_value(scope)));
+            contents.push_str(&format!("\t{name} = \"{}\"\n", escape_value(value)));
+        } else {
+            contents.push_str(&format!(
+                "\n[credential]\n\t{key} = \"{}\"\n",
+                escape_value(value)
+            ));
+        }
+    }
+    Ok(contents)
+}
+
+fn escape_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t")
+        .replace('\u{8}', "\\b")
+}
+
+pub(crate) fn isolated_git_command(config: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .env("GIT_CONFIG_GLOBAL", config)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_CONFIG_SYSTEM")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_CONFIG");
+    command
 }
 
 fn escape_path(path: &Path) -> Result<String> {
@@ -250,10 +332,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bundled_config_is_valid_and_portable() {
+    fn discovers_system_credentials_without_importing_other_settings() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
-        let prepared = prepare(&ConfigSource::Bundled, temp.path(), temp.path()).unwrap();
-        let text = fs::read_to_string(prepared.path()).unwrap();
+        let system = temp.path().join("system.config");
+        let user = temp.path().join("user.config");
+        fs::write(&system, "[credential]\nhelper = manager\n[http]\nsslVerify = false\n[filter \"lfs\"]\nprocess = unwanted\n").unwrap();
+        fs::write(&user, "[credential]\nnamespace = test-namespace\n").unwrap();
+        let mut command = Command::new("git");
+        command
+            .current_dir(temp.path())
+            .env("GIT_CONFIG_SYSTEM", system)
+            .env("GIT_CONFIG_GLOBAL", user)
+            .env("GIT_CONFIG_NOSYSTEM", "0")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env_remove("GIT_CONFIG")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE");
+        let config = read_credentials(command).unwrap();
+        assert!(config.contains("helper = \"manager\""));
+        assert!(config.contains("namespace = \"test-namespace\""));
+        assert!(!config.contains("sslverify"));
+        assert!(!config.contains("unwanted"));
+    }
+
+    #[cfg(feature = "backend-git2")]
+    #[test]
+    fn credential_projection_preserves_order_scopes_and_escaping() {
+        let text = credential_config(b"credential.helper\nmanager\0credential.helper\n\0credential.helper\n!echo \"quoted\"\\path\0credential.https://example.invalid/owner.repo.usehttppath\ntrue\0credential.interactive\0").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config");
+        fs::write(&path, text).unwrap();
+        let config = git2::Config::open(&path).unwrap();
+        let mut helpers = Vec::new();
+        let mut entries = config.multivar("credential.helper", None).unwrap();
+        while let Some(entry) = entries.next() {
+            helpers.push(entry.unwrap().value().unwrap().to_owned());
+        }
+        assert_eq!(helpers, ["manager", "", "!echo \"quoted\"\\path"]);
+        assert!(config
+            .get_bool("credential.https://example.invalid/owner.repo.usehttppath")
+            .unwrap());
+        assert!(config.get_bool("credential.interactive").unwrap());
+    }
+
+    #[test]
+    fn bundled_config_is_valid_and_portable() {
+        let text = BUNDLED_CONFIG;
         assert!(text.contains("sslVerify = true"));
         assert!(!text.contains("credential.helper"));
         assert!(!text.contains("proxy"));

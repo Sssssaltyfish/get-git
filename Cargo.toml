@@ -1,6 +1,6 @@
 [package]
 name = "get-git"
-version = "0.3.0"
+version = "0.3.1"
 authors = ["Igna <saltyfish2233@gmail.com>"]
 description = "Download one file or directory from a GitHub repository without checking out the rest"
 categories = ["command-line-utilities", "accessibility"]

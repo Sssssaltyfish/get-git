@@ -51,7 +51,7 @@ Run `get-git --help` for the complete option list.
 - A system Git 2.49+ is preferred. It uses `clone --revision`, `--depth=1`, `--no-tags`, `--filter=blob:none`, and `--no-checkout`; only the selected literal path is checked out. Directory blobs are requested in one `fetch --stdin` batch before checkout.
 - If system Git is missing or older, the embedded `git2` backend is used. It needs no `git` executable and performs a depth-one fetch. If a transport explicitly rejects shallow fetches, it alone falls back to a full fetch.
 
-The embedded backend cannot currently request a partial-clone object filter through git2's high-level fetch API. Consequently, `auto` intentionally chooses modern system Git for giant repositories. Use `--backend git2` to require a no-executable run, or `--backend system` to require the optimized external path and its version check.
+The embedded backend cannot currently request a partial-clone object filter through git2's high-level fetch API. Consequently, `auto` intentionally chooses modern system Git for giant repositories. Use `--backend git2` for embedded transfers, or `--backend system` to require the optimized external path and its version check. Embedded transfers work without Git installed; when available, Git is also used to discover credential settings and run credential helpers.
 
 The system Git version is checked once while selecting the backend. Short branch or tag names and copied GitHub URLs still need a remote advertisement for correct slash-containing-ref disambiguation; an explicit `refs/...` name or full object ID together with `--path` does not.
 
@@ -70,7 +70,15 @@ If no configuration option is supplied, get-git uses this bundled configuration:
     sslVerify = true
 ```
 
-It deliberately contains no machine paths, proxy, credential helper, identity, URL rewrite, or performance override. That makes default behavior reproducible across machines, although private repositories and managed networks may require an explicit configuration source.
+The bundled file contains no machine paths, proxy, credential helper, identity, URL rewrite, or performance override. At runtime, when Git is installed, get-git supplements it with **only `credential.*` settings** from Git's effective configuration in the current directory. This includes system-level helpers such as Git Credential Manager, user and repository overrides, resolved includes, URL-scoped settings, and helper reset/order semantics. Other host settings remain isolated. No passwords or tokens are copied into the configuration.
+
+Private repositories can therefore use the same configured credential helper as ordinary Git, without extra flags:
+
+```console
+get-git https://github.com/owner/private-repo/blob/main/README.md
+```
+
+Both backends use the selected credential settings. For embedded HTTPS transfers, get-git delegates to `git credential fill` when Git is available, so Git handles helper chains, shell commands, and GCM discovery. Without Git, the embedded backend retains git2's direct helper support; configured helpers still need their own executables. Credential lookup failures do not print helper output, which may contain secrets.
 
 The following options are mutually exclusive:
 
@@ -81,7 +89,7 @@ The following options are mutually exclusive:
 
 get-git writes a temporary wrapper that includes only the selected source files. The system backend sets `GIT_CONFIG_GLOBAL` to that wrapper and disables normal system configuration; the embedded backend attaches the same wrapper to its temporary repository. Git's documented configuration locations and precedence are described in [`git-config`](https://git-scm.com/docs/git-config#FILES).
 
-Use `--user-config` when you want an existing credential helper, proxy, Git LFS filter, or `url.*.insteadOf` rule. Use `--git-config` when reproducibility requires a purpose-built file. Conditional includes still evaluate in get-git's temporary repository context, so a condition tied to the original repository path may not match.
+Explicit configuration options retain their isolation: only the selected source files are included, without adding ambient credential settings. In particular, `--user-config` excludes system-level helpers; on Git for Windows, GCM is often configured at system level. Use the default for normal GCM authentication, or select a file that includes the required helper settings. Use `--user-config` for user-level proxy, Git LFS filter, or `url.*.insteadOf` rules, and `--git-config` for a purpose-built file. Conditional includes in explicitly selected files still evaluate in get-git's temporary repository context, so a condition tied to the original repository path may not match.
 
 ## Work and output directories
 
@@ -103,7 +111,7 @@ The default release build enables both backends and vendors OpenSSL for the embe
 cargo build --release
 ```
 
-Build a self-contained backend that never invokes environment Git:
+Build a backend that can transfer repositories without environment Git:
 
 ```console
 cargo build --release --no-default-features \
@@ -127,7 +135,7 @@ cargo test --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Command-level tests live under `tests/`. They create a real Git object database, exercise both backends, clear `PATH` for the embedded run, select explicit and project configuration, choose a work-directory base, and verify transactional replacement. They do not depend on GitHub or mutate the source tree.
+Command-level tests live under `tests/`. They create a real Git object database, exercise both backends, clear `PATH` for the embedded run, select explicit and project configuration, choose a work-directory base, and verify transactional replacement. A local HTTP server also verifies authenticated reference discovery and directory downloads through both backends. Unit tests cover system credential discovery, configuration isolation, helper chains, resets, and URL-scoped settings. Tests do not depend on GitHub or real credentials.
 
 ## License
 
